@@ -21,14 +21,17 @@ import json
 import sys
 
 from collections import OrderedDict
+from datetime import datetime
 from nose.plugins.attrib import attr
+from nose.plugins.skip import SkipTest
 from nose.tools import assert_equal, assert_true, assert_false
 
+from django.test.client import Client
 from django.urls import reverse
 from azure.conf import is_adls_enabled
 
 from desktop import appmanager
-from desktop.conf import APP_BLACKLIST
+from desktop.conf import APP_BLACKLIST, ENABLE_PROMETHEUS
 from desktop.lib.django_test_util import make_logged_in_client
 from desktop.lib.test_utils import grant_access, add_permission
 from desktop.models import Directory, Document, Document2
@@ -565,6 +568,92 @@ def test_get_interpreters_to_show():
     appmanager.DESKTOP_MODULES = []
     appmanager.DESKTOP_APPS = None
     appmanager.load_apps(APP_BLACKLIST.get())
+
+
+def fake_execute_notebook(request, notebook, snippet):
+  history_doc = Document2.objects.create(
+    name='select_table',
+    type='query-hive',
+    owner=request.user,
+    is_history=True,
+    last_modified=datetime.now()
+  )
+  Document.objects.link(
+    history_doc,
+    name=history_doc.name,
+    owner=history_doc.owner,
+    description=history_doc.description,
+    extra='query-hive'
+  )
+  history_doc.update_data(dict())
+  history_doc.search = "search"
+  history_doc.save()
+  return {
+      "status": 0,
+      "history_id": 50612,
+      "handle": {
+          "log_context": None,
+          "statements_count": 1,
+          "end": {
+              "column": 21,
+              "row": 0
+          },
+          "statement_id": 0,
+          "session_type": "hive",
+          "has_more_statements": False,
+          "start": {
+              "column": 0,
+              "row": 0
+          },
+          "secret": "2BdRjLoBQQuDQmvmTHv/2A==\n",
+          "has_result_set": True,
+          "session_guid": "6b43c8de486c8676:cc6eb7c1569e798c",
+          "session_id": 456,
+          "statement": "SELECT * from web_logs",
+          "operation_type": 0,
+          "modified_row_count": None,
+          "guid": "6uxU4TinQk6Qhe/gxEo24g==\n",
+          "previous_statement_hash": "171ec4d8390a2d5f080b91df606d69fd823579bcc762751f06798547"
+      },
+      "history_uuid": "fd1740b7-b8fb-469b-bca5-cc4f49493314"
+  }
+
+
+def reset_all_query_history():
+  """Reset to a clean state by deleting all user profiles"""
+  for doc2 in Document2.objects.all():
+    doc2.delete()
+
+class TestQueriesMetrics(object):
+
+  def setUp(self):
+    reset_all_query_history()
+    self.client = make_logged_in_client(username="test", groupname="default", recreate=True, is_superuser=False)
+    self.user = User.objects.get(username="test")
+
+    grant_access("test", "default", "notebook")
+    grant_access("test", "default", "beeswax")
+    grant_access("test", "default", "hive")
+
+
+  def tearDown(self):
+    reset_all_query_history()
+
+
+  @patch('notebook.api._execute_notebook')
+  def test_queries_num(self, mock_execute_notebook):
+    mock_execute_notebook.side_effect = fake_execute_notebook
+    self.client.post(reverse('notebook:execute'), { 'engine': 'hive' })
+    from notebook.metrics import num_of_queries
+    count = num_of_queries()
+    assert_equal(1, count)
+
+    if not ENABLE_PROMETHEUS.get():
+      raise SkipTest
+
+    c = Client()
+    response = c.get('/metrics')
+    assert_true(b'hue_queries_numbers 1.0' in response.content, response.content)
 
 
 class TestAnalytics(object):
